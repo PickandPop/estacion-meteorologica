@@ -1,0 +1,107 @@
+#include "LoRaWan_APP.h"
+#include "Arduino.h"
+#include <Wire.h>
+#include <Adafruit_BMP280.h>
+
+
+// Definición de pines I2C secundarios para la Heltec V3
+#define SDA_2 41
+#define SCL_2 42
+#define VEXT_PIN 36 // Pin de control de alimentación externa
+
+#define RF_FREQUENCY           915000000
+#define TX_OUTPUT_POWER        14
+#define LORA_BANDWIDTH         0
+#define LORA_SPREADING_FACTOR  7
+#define LORA_CODINGRATE        1
+#define LORA_PREAMBLE_LENGTH   8
+
+#define MI_ID 1 // ID de este nodo
+
+const uint64_t TIEMPO_SLEEP = 60ULL; // tiempo descanso segundos : 120.000 mili segundos
+
+struct __attribute__((__packed__)) TramaLoRa {
+  uint8_t idDestino;
+  uint8_t idOrigen;
+  uint8_t tipoMensaje;
+  int16_t temperatura;
+  uint16_t presionAtmosferica;
+};
+
+TramaLoRa rxTrama;
+TramaLoRa txTrama;
+
+bool transmitido = false;
+static RadioEvents_t RadioEvents;
+
+// Instanciar el segundo bus I2C de hardware del ESP32-S3
+TwoWire I2Ctwo = TwoWire(1);
+
+Adafruit_BMP280 sensor_temp(&I2Ctwo); // Asociar el sensor al segundo bus
+
+void OnTxDone(void) {
+  transmitido = true;
+}
+
+
+void setup() {
+
+  Serial.begin(115200);
+
+   // Encender la alimentación externa de la placa (Vext)
+  pinMode(VEXT_PIN, OUTPUT);
+  digitalWrite(VEXT_PIN, LOW); // LOW habilita la energía a los sensores
+  delay(100);
+
+    // Inicializar el bus I2C secundario en los pines asignados
+  I2Ctwo.begin(SDA_2, SCL_2, 100000);
+  
+  if(!sensor_temp.begin(0x76)){
+    Serial.println("-- Error sensor, revisar conexiones");
+    while(1);
+  }
+
+  // configuraciones inciales sensor 
+  sensor_temp.setSampling(Adafruit_BMP280::MODE_NORMAL,     /* Modo operativo */
+                Adafruit_BMP280::SAMPLING_X2,     /* Sobremuestreo temperatura */
+                Adafruit_BMP280::SAMPLING_X16,    /* Sobremuestreo presión */
+                Adafruit_BMP280::FILTER_X16,      /* Filtrado */
+                Adafruit_BMP280::STANDBY_MS_500); /* Tiempo de espera */
+  
+
+  //  Inicializar Radio LoRa
+  Mcu.begin(HELTEC_BOARD, SLOW_CLK_TPYE);
+  RadioEvents.TxDone = OnTxDone;
+  Radio.Init(&RadioEvents);
+
+  Radio.SetChannel(RF_FREQUENCY);
+  Radio.SetTxConfig(MODEM_LORA, TX_OUTPUT_POWER, 0, LORA_BANDWIDTH, LORA_SPREADING_FACTOR, LORA_CODINGRATE, LORA_PREAMBLE_LENGTH, false, true, 0, 0, false, 3000);
+  Radio.SetRxConfig(MODEM_LORA, LORA_BANDWIDTH, LORA_SPREADING_FACTOR, LORA_CODINGRATE, 0, LORA_PREAMBLE_LENGTH, 0, false, 0, true, 0, 0, false, true);
+  Radio.SetSyncWord(0x12);
+
+  // Armar paquete dirigido al Maestro (ID 0)
+  TramaLoRa txTrama;
+  txTrama.idDestino = 0;      // Hacia el Maestro
+  txTrama.idOrigen = MI_ID;   // Mi ID (1)
+  txTrama.tipoMensaje = 2;    // Tipo de trama con datos
+  txTrama.temperatura = sensor_temp.readTemperature()*10;  
+  txTrama.presionAtmosferica = 10;
+
+  // Envio mensaje 
+  Radio.Send((uint8_t *)&txTrama, sizeof(TramaLoRa));
+}
+
+void loop() {
+ Radio.IrqProcess();
+
+  if (transmitido) {
+    Serial.println("Mensaje enviado modo sleep");
+    Radio.Sleep(); // Apago chip SX1262
+    digitalWrite(VEXT_PIN,HIGH);  // Corto energia 
+    
+    //Configuracion de tiempo de descanso
+    uint64_t tiempo_microsegundos = TIEMPO_SLEEP * 1000000ULL;
+    esp_sleep_enable_timer_wakeup( tiempo_microsegundos);
+    esp_deep_sleep_start();
+  }
+}
