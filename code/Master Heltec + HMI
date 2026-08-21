@@ -1,0 +1,232 @@
+#include <HardwareSerial.h>
+#include <ModbusRtu.h>
+#include "Arduino.h"
+#include <RadioLib.h>
+#include <PubSubClient.h> 
+#include <WiFi.h>
+// #include "LoRaWan_APP.h" <-- ELIMINADO PARA EVITAR CONFLICTO CON RADIOLIB
+
+// ----------------- LoRa (RadioLib) -----------------
+#define HELTEC_CS   8
+#define HELTEC_DIO1 14
+#define HELTEC_RST  12
+#define HELTEC_BUSY 13
+
+SX1262 radio = new Module(HELTEC_CS, HELTEC_DIO1, HELTEC_RST, HELTEC_BUSY);
+
+#define ID_MAESTRO 0
+
+struct __attribute__((__packed__)) TramaLoRa {
+  uint8_t idDestino;
+  uint8_t idOrigen;
+  uint8_t tipoMensaje;
+  int16_t temperatura;
+  int16_t presionAtmosferica;
+};
+ 
+
+// ------ WiFi & ThingsBoard Config --------
+#define WIFI_SSID           "FIBRA-WIFI6-5C8F"
+#define WIFI_PASSWORD       "wHaZmPZ9fMXeUXKemXSm"
+//#define TOKEN               "GqHgMicANoFsTPJA6v8Y" // Access Token del Maestro -> Version Reyes
+#define TOKEN               "Ai9znLXyvFKz5CNorZfm"   // Access Token del Maestro  -> Version Sevald
+
+
+#define THINGSBOARD_SERVER  "thingsboard.cloud"
+
+// --- Objects ---
+WiFiClient espClient;
+PubSubClient mqttClient(espClient); 
+
+// ----------------- Modbus RTU -----------------
+#define ID 1            // Dirección de Nodo Modbus
+#define PIN_POTE 7      // GPIO7
+#define PIN_LED 5       // GPIO5
+#define VEXT_PIN 36     // Control Vext Heltec
+
+// Pines UART2 para la HMI Delta
+#define RX_DELTA 19     
+#define TX_DELTA 20     
+
+HardwareSerial SerialDelta(2);
+Modbus slave;
+
+int AUTO = 0;
+int MAN = 1;
+int pump_relay = 10;
+
+unsigned long ultimoIntentoMQTT = 0;
+
+float temp_lote1 = 0.0;
+float temp_lote2 = 0.0;
+
+volatile bool paquete_recibido = false;
+TramaLoRa mensaje;
+
+// Array para 10 registros Modbus
+uint16_t mapeo[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+
+void IRAM_ATTR mensajeRecibido(void) {
+  paquete_recibido = true;
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // 1. Activar alimentación de periféricos (Vext)
+  pinMode(VEXT_PIN, OUTPUT);
+  digitalWrite(VEXT_PIN, LOW); 
+  delay(100);
+
+  // 2. Configurar Wi-Fi (Modo Estación)
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  // 3. Configurar Servidor MQTT
+  mqttClient.setServer(THINGSBOARD_SERVER, 1883);
+
+  // 4. Inicializar Radio LoRa
+  int state = radio.begin(915.0, 125.0, 7, 5, 0x12, 10);
+  if (state == RADIOLIB_ERR_NONE) {
+    Serial.println("👑 MAESTRO LISTO (915 MHz, Sync 0x12)");
+    radio.setDio1Action(mensajeRecibido);
+    radio.startReceive();
+  } else {
+    Serial.println("❌ Error al iniciar radio LoRa");
+    while (true);
+  }
+
+  // 5. Inicializar UART2 para HMI Delta y Modbus
+  SerialDelta.begin(9600, SERIAL_8N1, RX_DELTA, TX_DELTA); // Ajustado a 9600 habitual de Modbus
+  slave = Modbus(ID, SerialDelta, 0); 
+  slave.start();
+}
+
+void loop() {
+  // 3. Actualizar variables lógicas de la HMI
+    updateHMI();
+      
+  // 1. Gestionar conexión MQTT a ThingsBoard en segundo plano
+  verificarConexionMQTT();
+
+  if (mqttClient.connected()) {
+    mqttClient.loop();
+  }
+  
+  // 2. Procesar paquete LoRa si llegó una interrupción
+  if (paquete_recibido) {
+    paquete_recibido = false;
+    
+    int state = radio.readData((uint8_t*)&mensaje, sizeof(TramaLoRa));
+    
+    if (state == RADIOLIB_ERR_NONE) { 
+      if (mensaje.idDestino == ID_MAESTRO) {
+        float temperatura_calculada = mensaje.temperatura / 10.0;
+
+        switch (mensaje.idOrigen) {
+          case 1: {
+            temp_lote1 = temperatura_calculada;
+            Serial.printf("-- Paquete ESCLAVO 1 -- Temp: %.1f °C\n", temp_lote1);
+            enviarMensajeTB("Nodo_Lote_1", temp_lote1);
+            break;
+          }
+          case 2: {
+            temp_lote2 = temperatura_calculada;
+            Serial.printf("-- Paquete ESCLAVO 2 -- Temp: %.1f °C\n", temp_lote2);
+            enviarMensajeTB("Nodo_Lote_2", temp_lote2);
+            break;
+          }
+          default:
+            Serial.println("⚠️ ID de mensaje desconocido");
+            break;
+        }
+      }
+    }
+
+    // Volver a poner el radio en escucha
+    radio.startReceive();
+  }
+
+  
+  // 4. Atender peticiones Modbus RTU de la pantalla Delta
+  slave.poll(mapeo, 10);
+}
+
+void updateHMI() {
+  // Asignación de temperatura actual a los registros Modbus
+  mapeo[9] = (int16_t)(temp_lote1 * 10);
+  mapeo[8] = (int16_t)(temp_lote2 * 10);
+
+  // Evaluar condición de alarma
+  if (temp_lote1 < -15 || temp_lote2 < -15) { 
+    bitWrite(mapeo[1], 3, 1);
+    bitWrite(mapeo[1], 4, 0);
+    bitWrite(mapeo[1], 5, 0);
+  } else if ((temp_lote1 >= -15 && temp_lote1 < 0) || (temp_lote2 >= -15 && temp_lote2 < 0)) {
+    bitWrite(mapeo[1], 4, 1);
+    bitWrite(mapeo[1], 3, 0);
+    bitWrite(mapeo[1], 5, 0);
+  } else {
+    bitWrite(mapeo[1], 5, 1); 
+    bitWrite(mapeo[1], 4, 0);
+    bitWrite(mapeo[1], 3, 0);
+  }
+
+  // Actualización de Modo AUTO / MAN desde HMI
+  if (bitRead(mapeo[0], 1)) {
+    AUTO = 1; MAN = 0;
+  }
+  if (bitRead(mapeo[0], 2)) {
+    AUTO = 0; MAN = 1;
+  }
+  bitWrite(mapeo[1], 1, AUTO);
+  bitWrite(mapeo[1], 2, MAN);
+
+  // Control de Bomba en AUTOMÁTICO
+  if ((temp_lote1 < -15 || temp_lote2 < -15) && AUTO) {
+    bitWrite(mapeo[0], 3, 1);
+    digitalWrite(pump_relay, HIGH);
+  } else if (AUTO) {
+    bitWrite(mapeo[0], 3, 0);
+    digitalWrite(pump_relay, LOW);
+  }
+
+  // Control de Bomba en MANUAL
+  if (MAN) {
+    if (bitRead(mapeo[0], 6)) {
+      bitWrite(mapeo[0], 3, 1);
+      digitalWrite(pump_relay, HIGH);
+    }
+    if (bitRead(mapeo[0], 4)) {
+      bitWrite(mapeo[0], 3, 0);
+      digitalWrite(pump_relay, LOW);
+    }
+  }
+}
+
+void enviarMensajeTB(String nombreNodo, float temp) {
+  if (!mqttClient.connected()) return;
+
+  String payload = "{\"" + nombreNodo + "\": [{\"temperatura\": " + String(temp, 1) + "}]}";
+
+  // Se agrega la longitud de la cadena como tercer argumento
+  mqttClient.publish("v1/gateway/telemetry", (const uint8_t*)payload.c_str(), payload.length());
+}
+
+void verificarConexionMQTT() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  if (!mqttClient.connected()) {
+    unsigned long ahora = millis();
+    if (ahora - ultimoIntentoMQTT > 5000) {
+      ultimoIntentoMQTT = ahora;
+      Serial.print("Intentando conectar a ThingsBoard...");
+
+      if (mqttClient.connect("Heltec_Maestro", TOKEN, NULL)) {
+        Serial.println(" ¡CONECTADO!");
+      } else {
+        Serial.printf(" Falló (error: %d)\n", mqttClient.state());
+      }
+    }
+  }
+}
