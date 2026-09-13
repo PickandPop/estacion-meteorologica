@@ -57,6 +57,10 @@ int pump_relay = 10;
 float temp_lote1 = 0.0;
 float temp_lote2 = 0.0;
 
+// NUEVAS VARIABLES PARA EL RSSI
+float rssi_lote1 = 0.0;
+float rssi_lote2 = 0.0;
+
 // Banderas para sincronizar el envío a ThingsBoard desde el Core 1 hacia el Core 0
 volatile bool nuevoDatoNodo1 = false;
 volatile bool nuevoDatoNodo2 = false;
@@ -100,13 +104,15 @@ void tareaThingsBoard(void * pvParameters) {
   // Nuevo mensaje -> actualizacion ThingBoard
         if (nuevoDatoNodo1) {
           nuevoDatoNodo1 = false;
-          String p = "{\"Nodo_Lote_1\": [{\"temperatura\": " + String(temp_lote1, 1) + "}]}";
+          // SE AGREGA EL PARÁMETRO RSSI AL JSON
+          String p = "{\"Nodo_Lote_1\": [{\"temperatura\": " + String(temp_lote1, 1) + ", \"rssi\": " + String(rssi_lote1, 1) + "}]}";
           mqttClient.publish("v1/gateway/telemetry", (const uint8_t*)p.c_str(), p.length());
         }
 
         if (nuevoDatoNodo2) {
           nuevoDatoNodo2 = false;
-          String p = "{\"Nodo_Lote_2\": [{\"temperatura\": " + String(temp_lote2, 1) + "}]}";
+          // SE AGREGA EL PARÁMETRO RSSI AL JSON
+          String p = "{\"Nodo_Lote_2\": [{\"temperatura\": " + String(temp_lote2, 1) + ", \"rssi\": " + String(rssi_lote2, 1) + "}]}";
           mqttClient.publish("v1/gateway/telemetry", (const uint8_t*)p.c_str(), p.length());
         }
       }
@@ -178,15 +184,15 @@ void loop() {
         switch (mensaje.idOrigen) {
           case 1: {
             temp_lote1 = temperatura_calculada;
-            //Serial.printf("-- Paquete ESCLAVO 1 -- Temp: %.1f °C\n", temp_lote1);
+            rssi_lote1 = rssi; // SE GUARDA EL RSSI DEL NODO 1
             Serial.printf("📡 [NODO 1] Temp: %.1f °C | RSSI: %.1f dBm | SNR: %.2f dB\n", temp_lote1, rssi, snr);
             nuevoDatoNodo1 = true; // Notifica a la tarea del Core 0 para enviar por MQTT
             break;
           }
           case 2: {
             temp_lote2 = temperatura_calculada;
-            //Serial.printf("-- Paquete ESCLAVO 2 -- Temp: %.1f °C\n", temp_lote2);
-             Serial.printf("📡 [NODO 1] Temp: %.1f °C | RSSI: %.1f dBm | SNR: %.2f dB\n", temp_lote2, rssi, snr);
+            rssi_lote2 = rssi; // SE GUARDA EL RSSI DEL NODO 2
+             Serial.printf("📡 [NODO 2] Temp: %.1f °C | RSSI: %.1f dBm | SNR: %.2f dB\n", temp_lote2, rssi, snr); // (Corregí NODO 1 a NODO 2 en el texto)
             nuevoDatoNodo2 = true; // Notifica a la tarea del Core 0 para enviar por MQTT
             break;
           }
