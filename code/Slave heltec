@@ -1,16 +1,15 @@
 #include "LoRaWan_APP.h"
 #include "Arduino.h"
 #include <Wire.h>
-
 #include <Adafruit_BMP280.h>
-
-
 
 // Definición de pines I2C secundarios para la Heltec V3
 #define SDA_2 41
 #define SCL_2 42
 #define VEXT_PIN 36 // Pin de control de alimentación externa
 
+// Pin del LED indicador de transmisión
+#define PIN_LED 35 // GPIO 35 es el LED blanco integrado en la Heltec V3
 
 #define RF_FREQUENCY           915000000
 #define TX_OUTPUT_POWER        20         // Potencia señal 22dBm máxima energia 14 normal -> 
@@ -46,17 +45,19 @@ void OnTxDone(void) {
   transmitido = true;
 }
 
-
 void setup() {
-
   Serial.begin(115200);
 
-   // Encender la alimentación externa de la placa (Vext)
+  // Configurar pin del LED
+  pinMode(PIN_LED, OUTPUT);
+  digitalWrite(PIN_LED, LOW); // Asegurar que inicie apagado
+
+  // Encender la alimentación externa de la placa (Vext)
   pinMode(VEXT_PIN, OUTPUT);
   digitalWrite(VEXT_PIN, LOW); // LOW habilita la energía a los sensores
   delay(100);
 
-    // Inicializar el bus I2C secundario en los pines asignados
+  // Inicializar el bus I2C secundario en los pines asignados
   I2Ctwo.begin(SDA_2, SCL_2, 100000);
   
   if(!sensor_temp.begin(0x76)){
@@ -71,7 +72,6 @@ void setup() {
                 Adafruit_BMP280::FILTER_X16,      /* Filtrado */
                 Adafruit_BMP280::STANDBY_MS_500); /* Tiempo de espera */
   
-
   //  Inicializar Radio LoRa
   Mcu.begin(HELTEC_BOARD, SLOW_CLK_TPYE);
   RadioEvents.TxDone = OnTxDone;
@@ -83,12 +83,18 @@ void setup() {
   Radio.SetSyncWord(0x12);
 
   // Armar paquete dirigido al Maestro (ID 0)
-
   txTrama.idDestino = 0;      // Hacia el Maestro
   txTrama.idOrigen = MI_ID;   // Mi ID (1)
   txTrama.tipoMensaje = 2;    // Tipo de trama con datos
-  txTrama.temperatura = sensor_temp.readTemperature()*10;  
-  txTrama.presionAtmosferica = 10;
+  
+  // Lectura real de temperatura y presión
+  txTrama.temperatura = sensor_temp.readTemperature() * 10;  
+  
+  // La presión se divide por 100 para convertir de Pascales (Pa) a hectoPascales (hPa / milibares)
+  txTrama.presionAtmosferica = (uint16_t)(sensor_temp.readPressure() / 100.0);
+
+  // Encender el LED visualmente antes de enviar el mensaje
+  digitalWrite(PIN_LED, HIGH);
 
   // Envio mensaje 
   Radio.Send((uint8_t *)&txTrama, sizeof(TramaLoRa));
@@ -98,9 +104,13 @@ void loop() {
  Radio.IrqProcess();
 
   if (transmitido) {
-    Serial.println("-- Mensaje enviado -> modo sleep");
+    Serial.println("-- Mensaje enviado -> apagando LED y entrando a modo sleep");
+    
+    // Apagar el LED porque la transmisión terminó
+    digitalWrite(PIN_LED, LOW); 
+    
     Radio.Sleep(); // Apago chip SX1262
-    digitalWrite(VEXT_PIN,HIGH);  // Corto energia 
+    digitalWrite(VEXT_PIN,HIGH);  // Corto energia de sensores periféricos 
     
     //Configuracion de tiempo de descanso
     uint64_t tiempo_microsegundos = TIEMPO_SLEEP * 1000000ULL;
